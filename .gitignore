@@ -1,0 +1,8 @@
+log
+run.sh
+
+# Ignore everything in dataset folder except retrieve.py
+dataset/*
+!dataset/retrieve.py
+
+best_model_weight
