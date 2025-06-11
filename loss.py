@@ -2,6 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from timm.models.layers import trunc_normal_
+
+# Segmented Relu
+# @torch.jit.script
+def SeLU(x, ranges, ts):
+    # use torch.relu implementation, relu is written in c, which is fast!!!!
+
+    # x = x + ts[0]*torch.relu(ranges[0] - x) + ts[1]*torch.relu(x - ranges[1]) \
+    #      + ts[2]*torch.relu(ranges[2] - x) **2 + ts[3]*torch.relu(x - ranges[3])**2
+
+    order = ts.shape[0] // 2
+    output = torch.zeros_like(x)
+    for i in range(order):
+        output += ts[2*i]*torch.relu(ranges[2*i] - x) ** (i+1) + ts[2*i+1]*torch.relu(x - ranges[2*i+1]) ** (i+1)
+
+    # output = ts[1]*torch.relu(x - ranges[1]) + ts[3]*torch.relu(x - ranges[3])**2
+
+    return output
 
 def labels_to_probs(labels, num_classes):
     """
@@ -285,7 +303,97 @@ class ce_loss_mt(nn.Module):
 
         loss = nn.CrossEntropyLoss()
         return loss(outputs, train_targets)
+    
+class ce_loss_mt_MoS(nn.Module):
+    """
+    Compute the multi-target cross-entropy loss with Mixture of Softmaxes (MoS) outputs
+    """
+    
+    def __init__(self, num_classes, device):
+        super(ce_loss_mt_MoS, self).__init__()
+        self.num_classes = num_classes
+        self.device = device
 
+
+    def forward(self, probs, labels):
+        train_targets = labels_to_probs(labels, self.num_classes).to(self.device) # (batch_size, num_classes)
+
+        # calculate the cross-entropy loss
+        ce = -torch.sum(train_targets * torch.log(probs + 1e-10), dim=1) # (batch_size)
+
+        loss = torch.mean(ce)
+
+        return loss
+
+class ce_loss_mt_multimax(nn.Module):
+    """
+    Compute the multi-target cross-entropy loss with MultiMax outputs
+    """
+    
+    def __init__(self, num_classes, device):
+        super(ce_loss_mt_multimax, self).__init__()
+        self.num_classes = num_classes
+        self.device = device
+
+        self.order = 2
+
+        self.ranges = nn.Parameter(torch.zeros((2*self.order), device=device), requires_grad=True)
+        self.ts = nn.Parameter(torch.zeros((2*self.order), device=device), requires_grad=True)
+        # self.ts = torch.tensor([-0.1, -0.1, -0.01, -0.01], device=device)
+
+        # self.linear_1 = nn.Linear(1, 8, device=device)
+        # self.relu = nn.ReLU()
+        # self.linear_2 = nn.Linear(8, 1, device=device)
+
+        # trunc_normal_(self.ts, mean=0.0, std=.02)
+        # trunc_normal_(self.ranges, mean=0.0, std=.02)
+
+        # self.dropout = nn.Dropout(0.1)
+
+    def forward(self, outputs, labels):
+        train_targets = labels_to_probs(labels, self.num_classes).to(self.device) # (batch_size, num_classes)
+
+        # # Identify multi-target samples
+        # num_unique_labels = torch.tensor([len(set(l)) for l in labels], device=self.device)
+        # multi_target_mask = (num_unique_labels > 1).unsqueeze(1)
+
+        # SeLU logits
+        selu_term = SeLU(outputs, self.ranges, self.ts) # (batch_size, num_classes)
+
+        # if self.training:
+        #     # dropout samples with certain probability
+        #     sample_mask = torch.rand(logits.shape[0], device=self.device) < 0.1
+        #     logits = logits * sample_mask.unsqueeze(1)
+        # logits = self.dropout(logits)
+        
+        # # Add SeLU term only for multi-target samples
+        # logits = outputs + selu_term * multi_target_mask
+
+        logits = outputs + selu_term
+
+        # ts = -self.ts**2
+        # logits = SeLU(outputs, self.ranges, ts) # (batch_size, num_classes)
+        # logits = outputs * 0.8
+
+        # # Apply NN element-wise: reshape to (batch_size * num_classes, 1), apply NN, then reshape back
+        # batch_size, num_classes = outputs.shape
+        # outputs_flat = outputs.view(-1, 1)  # (batch_size * num_classes, 1)
+        
+        # logits_flat = self.linear_1(outputs_flat)  # (batch_size * num_classes, 8)
+        # logits_flat = self.relu(logits_flat)       # (batch_size * num_classes, 8)
+        # logits_flat = self.linear_2(logits_flat)   # (batch_size * num_classes, 1)
+        
+        # logits = logits_flat.view(batch_size, num_classes)  # (batch_size, num_classes)
+        # logits += outputs
+
+        probs = torch.softmax(logits, dim=-1) # (batch_size, num_classes)
+
+        # calculate the cross-entropy loss
+        ce = -torch.sum(train_targets * torch.log(probs + 1e-10), dim=1) # (batch_size)
+
+        loss = torch.mean(ce)
+
+        return loss
 
 class bpr_max_loss_mt(nn.Module):
     """

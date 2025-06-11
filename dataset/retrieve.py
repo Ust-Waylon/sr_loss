@@ -69,8 +69,8 @@ def output_processed_dataset(data_loader, loader_type, sess2tar_map, folder):
             
 if __name__ == "__main__":
     # dataset
-    # dataset_name = "diginetica"
-    # dataset_path = "../dataset/diginetica"
+    dataset_name = "diginetica"
+    dataset_path = "../dataset/diginetica"
     # dataset_name = "yoochoose64"
     # dataset_path = "../dataset/yoochoose64"
     # dataset_name = "yoochoose4"
@@ -79,14 +79,14 @@ if __name__ == "__main__":
     # dataset_path = "../dataset/gowalla"
     # dataset_name = "lastfm"
     # dataset_path = "../dataset/lastfm"
-    dataset_name = "retailrocket"
-    dataset_path = "../dataset/retailrocket"
+    # dataset_name = "retailrocket"
+    # dataset_path = "../dataset/retailrocket"
     train_sessions, valid_sessions, test_sessions, num_items = read_dataset(Path(dataset_path))
     print(f"dataset name: {dataset_name}, #items: {num_items}")
 
-    train_set = AugmentedDataset(train_sessions, padding=False)
-    valid_set = AugmentedDataset(valid_sessions, padding=False)
-    test_set = AugmentedDataset(test_sessions, padding=False)
+    train_set = AugmentedDataset(train_sessions, padding=False, max_session_len=50)
+    valid_set = AugmentedDataset(valid_sessions, padding=False, max_session_len=50)
+    test_set = AugmentedDataset(test_sessions, padding=False, max_session_len=50)
 
     train_loader = DataLoader(
         train_set,

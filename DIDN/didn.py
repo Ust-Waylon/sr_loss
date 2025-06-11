@@ -21,7 +21,7 @@ class DIDN(nn.Module):
 
     """
 
-    def __init__(self, n_items, hidden_size, embedding_dim, batch_size, max_len, position_embed_dim, alpha1,  alpha2, alpha3, pos_num,neighbor_num, n_layers=1):
+    def __init__(self, n_items, hidden_size, embedding_dim, batch_size, max_len, position_embed_dim, alpha1,  alpha2, alpha3, pos_num,neighbor_num, n_softmaxes=1, n_layers=1):
         super(DIDN, self).__init__()
         self.n_items = n_items
         self.hidden_size = hidden_size
@@ -35,6 +35,7 @@ class DIDN(nn.Module):
         self.alpha3 = alpha3
         self.pos_num = pos_num
         self.neighbor_num = neighbor_num
+        self.n_softmaxes = n_softmaxes
         self.emb = nn.Embedding(self.n_items, self.embedding_dim, padding_idx=0)
 
         self.position_emb = nn.Embedding(self.pos_num, self.position_embed_dim, padding_idx=0)
@@ -100,6 +101,10 @@ class DIDN(nn.Module):
         self.layernorm_sess = nn.LayerNorm(self.embedding_dim)
         self.layernorm_item = nn.LayerNorm(self.embedding_dim)
 
+        # Mixture of Softmaxes
+        self.prior_vectors = nn.Embedding(self.n_softmaxes, self.embedding_dim)
+        self.linear_layers = nn.Linear(self.embedding_dim, self.embedding_dim * self.n_softmaxes)
+        self.tanh_mos = nn.Tanh()
 
     def forward(self, seq, lengths, normalize_emb = False):
         seq = seq.transpose(0, 1) # added to make the code compatible with the dataloader
@@ -230,24 +235,52 @@ class DIDN(nn.Module):
         # RF_result = self.NDF(sess_final)
 
         sess_final = self.dropout30(sess_final)
-        sess_final = self.merge_n_c(sess_final)
+        sess_final = self.merge_n_c(sess_final) # [B, embedding_dim]
 
         item_embs = self.emb(torch.arange(self.n_items).to(self.device))
         item_embs = self.dropout15(item_embs)
 
         item_embs = self.bn1(item_embs)
-        item_embs = self.b(item_embs)
+        item_embs = self.b(item_embs) # [n_items, embedding_dim]
+
         if normalize_emb:
             # calculate the cosine similarity between the item embeddings and the session embeddings
             item_embs = self.layernorm_item(item_embs)
             sess_final = self.layernorm_sess(sess_final)
-            scores = torch.matmul(sess_final, item_embs.permute(1, 0))
-            # scale coefficient
+
+        if self.n_softmaxes > 1:
+            # project session embeddings
+            projected_emb = self.linear_layers(sess_final) # [B, embedding_dim * n_softmaxes]
+            projected_emb = projected_emb.view(projected_emb.size(0), self.n_softmaxes, self.embedding_dim) # [B, n_softmaxes, embedding_dim]
+            projected_emb = self.tanh_mos(projected_emb)
+            
+            # calculate softmax probabilities
+            logits = torch.matmul(projected_emb, item_embs.permute(1, 0)) # [B, n_softmaxes, n_items]
+            softmax_probs = torch.softmax(logits, dim=-1) # [B, n_softmaxes, n_items]
+
+            # calculate prior probabilities (dot product between session embeddings and prior vectors, followed by softmax)
+            prior_vectors = self.prior_vectors(torch.arange(self.n_softmaxes).to(self.device)) # [n_softmaxes, embedding_dim]
+            prior_logits = torch.matmul(sess_final, prior_vectors.permute(1, 0)) # [B, n_softmaxes]
+            prior_probs = torch.softmax(prior_logits, dim=-1).unsqueeze(-1) # [B, n_softmaxes, 1]
+
+            # weighted sum of softmax probabilities
+            probs = torch.sum(softmax_probs * prior_probs, dim=1) # [B, n_items]
+
+            # skip connection
+            original_probs = torch.matmul(sess_final, item_embs.permute(1, 0)) # [B, n_items]
+            original_probs = torch.softmax(original_probs, dim=-1) # [B, n_items]
+            probs = (probs + original_probs) / 2
+
+            # NOTE: when n_softmaxes > 1, the forward function returns the probabilities rather than the scores (logits)
+            return probs
+
+        scores = torch.matmul(sess_final, item_embs.permute(1, 0))
+
+        if normalize_emb:
             scores = scores * 12
-        else:
-            scores = torch.matmul(sess_final, item_embs.permute(1, 0))
 
         # scores = (scores + RF_result) / 2
+        # scores = torch.matmul(sess_final, item_embs.permute(1, 0))
 
         return scores
 

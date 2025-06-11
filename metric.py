@@ -43,19 +43,24 @@ def get_mrr(indices, targets):
     return mrr.item()
 
 
-def evaluate(indices, targets, k=20):
+def evaluate(probs, targets, ks=[10, 20]):
     """
     Evaluates the model using Recall@K, MRR@K scores.
 
     Args:
-        logits (B,C): torch.LongTensor. The predicted logit for the next items.
+        probs (B,C): torch.FloatTensor. The predicted probabilities for the next items.
         targets (B): torch.LongTensor. actual target indices.
 
     Returns:
         recall (float): the recall score
         mrr (float): the mrr score
     """
-    _, indices = torch.topk(indices, k, -1)
-    recall = get_recall(indices, targets)
-    mrr = get_mrr(indices, targets)
-    return recall, mrr
+    recalls = []
+    mrrs = []
+    for k in ks:
+        _, indices = torch.topk(probs, k, -1)
+        recall = get_recall(indices, targets)
+        mrr = get_mrr(indices, targets)
+        recalls.append(recall)
+        mrrs.append(mrr)
+    return recalls, mrrs
