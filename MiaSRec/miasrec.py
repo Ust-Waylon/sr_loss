@@ -165,7 +165,7 @@ class MIASREC(nn.Module):
         item_seq_w_mean[output_mask[:,:,0]] = 0
 
 
-        output = F.normalize(output, dim=2) # [B, L+1, D]
+        # output = F.normalize(output, dim=2) # [B, L+1, D]
 
         return item_seq_w_mean, output
 
@@ -176,15 +176,16 @@ class MIASREC(nn.Module):
 
         all_item_emb = self.item_embedding.weight # [N, D]
         all_item_emb = self.item_dropout(all_item_emb) # [N, D]
-        all_item_emb = F.normalize(all_item_emb, dim=-1) # [N, D] 
+        # all_item_emb = F.normalize(all_item_emb, dim=-1) # [N, D] 
 
         logits_all = output @ all_item_emb.T # [B, 1+L, D] @ [D, N] = [B, L, N]
 
-        max_logits = torch.max(logits_all, dim=1)[0] / self.temperature  # [B, N]  # logits[1] = [-1.4918,  0.1595, -2.9134,  ..., -1.2865,  1.9893,  2.8495],
+        max_logits = torch.max(logits_all, dim=1)[0]
+        # max_logits = max_logits / self.temperature  # [B, N]
         
         logits_all[item_seq == 0] = 0
         mean_logits = torch.sum(logits_all, dim=1) / torch.sum(item_seq != 0, dim=1, keepdim=True)  # [B, N]
-        mean_logits = mean_logits / self.temperature
+        # mean_logits = mean_logits / self.temperature
 
         logits = max_logits * self.beta_logit + mean_logits * (1 - self.beta_logit)
 

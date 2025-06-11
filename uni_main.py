@@ -8,6 +8,16 @@ import os
 import sys
 import argparse
 from functools import partial
+
+import time
+import numpy as np
+from tqdm import tqdm
+
+# debug mode
+debug = False
+if debug:
+    torch.autograd.set_detect_anomaly(True)
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', default='DIDN', help='model name')
 parser.add_argument('--dataset_path', default='datasets/diginetica/', help='dataset directory path')
@@ -20,12 +30,14 @@ parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--lr_dc', type=float, default=0.1, help='learning rate decay rate')
 parser.add_argument('--lr_dc_step', type=int, default=80,
                     help='the number of steps after which the learning rate decay')
-parser.add_argument('--topk', type=int, default=20, help='number of top score items selected for calculating recall and mrr metrics')
+parser.add_argument('--topk', nargs='+', type=int, default=[10, 20], help='a list of top k score items selected for calculating recall and mrr metrics')
 
 parser.add_argument('--single_target', default=False, help='single target')
 parser.add_argument('--cl', default=False, help='curriculum learning')
 parser.add_argument('--st_mt', default=False, help='get both st_labels and mt_labels from the dataset, only for the experiments about gradient magnitude')
 parser.add_argument('--normalize_emb', default=False, help='normalize item and session embeddings when calculating scores')
+parser.add_argument('--n_softmaxes', type=int, default=1, help='number of softmaxes, if set to >1, the loss type should be ce')
+parser.add_argument('--use_multimax', default=False, help='use multimax loss, if set to True, the loss type should be ce')
 
 # MiaSRec
 parser.add_argument('--beta_logit', type=float, default=0.9, help='beta logit')
@@ -35,51 +47,34 @@ print(args)
 
 os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_device)
 
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 import metric
 from dataset import *
 from loss import *
 
 # import necessary libraries corresponding to the model
 if args.model == 'DIDN':
-    import time
     import random
     import pickle
-    import numpy as np
-    from tqdm import tqdm
+    
     from os.path import join
-
-    import torch
-    from torch import nn
-    from torch.utils.data import DataLoader
-    import torch.nn.functional as F
-    import torch.optim as optim
-    from torch.optim.lr_scheduler import StepLR
+    
     from torch.autograd import Variable
     from torch.backends import cudnn
 
     from DIDN.didn import DIDN
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # debug mode
-    debug = False
-    if debug:
-        torch.autograd.set_detect_anomaly(True)
-
 
 elif args.model == 'MiaSRec':
     from logging import getLogger
-
-    import time
-    import numpy as np
-    from tqdm import tqdm
-
-    import torch
-    from torch import nn
-    from torch.utils.data import DataLoader
-    import torch.nn.functional as F
-    import torch.optim as optim
-    from torch.optim.lr_scheduler import StepLR
 
     sys.path.append("MiaSRec")
     from recbole.config import Config
@@ -87,16 +82,12 @@ elif args.model == 'MiaSRec':
     from recbole.utils import get_trainer, init_seed, set_color
 
     from miasrec import MIASREC
-    from tqdm import tqdm
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     from IPython import embed
 
-    # debug mode
-    debug = False
-    if debug:
-        torch.autograd.set_detect_anomaly(True)
+elif args.model == 'SASRec':
+    sys.path.append("SASRec")
+    from SASRec.model import SelfAttentiveSessionEncoder
 
 def trainForEpoch(train_loader, model, optimizer, epoch, num_epochs, criterion, log_aggr=1):
     model.train()
@@ -114,11 +105,17 @@ def trainForEpoch(train_loader, model, optimizer, epoch, num_epochs, criterion, 
                 outputs = model.forward(given_session, given_session_len, normalize_emb=args.normalize_emb)
             elif args.model == 'MiaSRec':
                 outputs = model.get_logits(given_session)
+            elif args.model == 'SASRec':
+                outputs = model.get_logits(given_session)
 
             if isinstance(criterion, bce_loss_mt):
                 loss = criterion(outputs, labels, given_session)
             elif isinstance(criterion, ce_loss_mt):
                 loss = criterion(outputs, labels, given_session_len, epoch)
+            elif isinstance(criterion, ce_loss_mt_multimax):
+                loss = criterion(outputs, labels)
+            elif isinstance(criterion, ce_loss_mt_MoS):
+                loss = criterion(outputs, labels)
             elif isinstance(criterion, ce_loss_mt_autocl):
                 loss = criterion(outputs, labels, given_session_len, epoch)
             elif isinstance(criterion, bpr_max_loss_mt):
@@ -191,11 +188,16 @@ def trainForEpoch(train_loader, model, optimizer, epoch, num_epochs, criterion, 
         print(f"Average gradient magnitude for single-target sessions: {avg_gradient_magnitude_st}")
         print(f"Average gradient magnitude for multi-target sessions: {avg_gradient_magnitude_mt}")
 
-def validate(valid_loader, model):
+    if hasattr(criterion, 'parameters') and list(criterion.parameters()):
+        print("Criterion parameters: ", list(criterion.parameters()))
+
+def validate(valid_loader, model, criterion = None):
     model.eval()
-    recalls = []
-    mrrs = []
+    recalls_list = []
+    mrrs_list = []
     with torch.no_grad():
+        output_max_list = []
+        output_min_list = []
         for given_session, given_session_label, given_session_len in tqdm(valid_loader):
             given_session = given_session.to(device)
             given_session_label = given_session_label.to(device)
@@ -204,16 +206,42 @@ def validate(valid_loader, model):
                 outputs = model.forward(given_session, given_session_len, normalize_emb=args.normalize_emb)
             elif args.model == 'MiaSRec':
                 outputs = model.get_logits(given_session)
+            elif args.model == 'SASRec':
+                outputs = model.get_logits(given_session)
 
-            probs = F.softmax(outputs, dim=1)
+            if args.n_softmaxes > 1:
+                probs = outputs
+            elif isinstance(criterion, ce_loss_mt_multimax):
+                # print the range of the outputs
+                output_min = outputs.min()
+                output_max = outputs.max()
+                output_max_list.append(output_max.item())
+                output_min_list.append(output_min.item())
 
-            recall, mrr = metric.evaluate(probs, given_session_label, k=20)
-            recalls.append(recall)
-            mrrs.append(mrr)
+                # outputs_flat = outputs.view(-1, 1)
+                # logits_flat = criterion.linear_1(outputs_flat)
+                # logits_flat = criterion.relu(logits_flat)
+                # logits_flat = criterion.linear_2(logits_flat)
+                # logits = logits_flat.view(outputs.shape[0], outputs.shape[1])
+                # outputs = logits + outputs
 
-    mean_recall = np.mean(recalls)
-    mean_mrr = np.mean(mrrs)
-    return mean_recall, mean_mrr
+                # outputs = SeLU(outputs, criterion.ranges, criterion.ts)
+
+                probs = torch.softmax(outputs, dim=-1)
+            else:
+                probs = F.softmax(outputs, dim=1)
+
+            recalls, mrrs = metric.evaluate(probs, given_session_label, ks=args.topk)
+            recalls_list.append(recalls)
+            mrrs_list.append(mrrs)
+
+    mean_recalls = np.mean(recalls_list, axis=0)
+    mean_mrrs = np.mean(mrrs_list, axis=0)
+    if output_max_list:
+        output_max = np.max(output_max_list)
+        output_min = np.min(output_min_list)
+        print(f"Output range: {output_min} to {output_max}")
+    return mean_recalls, mean_mrrs
     
 
 if __name__ == '__main__':
@@ -238,7 +266,10 @@ if __name__ == '__main__':
                      alpha2=0.1,
                      alpha3=0.1,
                      pos_num=2000,
-                     neighbor_num=5)
+                     neighbor_num=5,
+                     n_softmaxes=args.n_softmaxes)
+
+        padding_direction = 'right'
         
     elif args.model == 'MiaSRec':        
         config = {}
@@ -267,6 +298,21 @@ if __name__ == '__main__':
 
         model = MIASREC(config)
 
+        padding_direction = 'right'
+
+    elif args.model == 'SASRec':
+
+        max_len = 19
+
+        model = SelfAttentiveSessionEncoder(num_items=n_items,
+                                            hidden_size=64,
+                                            n_layers=2,
+                                            n_head=1,
+                                            max_session_length=max_len,
+                                            hidden_dropout_prob=0.2)
+        
+        padding_direction = 'left'
+
     else:
         raise ValueError(f'Model {args.model} not found')
     
@@ -282,27 +328,33 @@ if __name__ == '__main__':
         train_loader = DataLoader(train_data, 
                                   batch_size=args.batch_size, 
                                   shuffle=True, 
-                                  collate_fn=partial(collate_fn_train_st_mt, max_session_len=max_len))
+                                  collate_fn=partial(collate_fn_train_st_mt, max_session_len=max_len, padding_direction=padding_direction))
     elif args.single_target:
         train_loader = DataLoader(train_data, 
                                   batch_size=args.batch_size, 
                                   shuffle=True, 
-                                  collate_fn=partial(collate_fn_train, max_session_len=max_len, single_target=True))
+                                  collate_fn=partial(collate_fn_train, max_session_len=max_len, single_target=True, padding_direction=padding_direction))
     else:
         train_loader = DataLoader(train_data, 
                                 batch_size=args.batch_size, 
                                 shuffle=True, 
-                                collate_fn=partial(collate_fn_train, max_session_len=max_len))
+                                collate_fn=partial(collate_fn_train, max_session_len=max_len, padding_direction=padding_direction))
     valid_loader = DataLoader(valid_data, 
                               batch_size=args.batch_size, 
                               shuffle=False, 
-                              collate_fn=partial(collate_fn_valid, max_session_len=max_len))
+                              collate_fn=partial(collate_fn_valid, max_session_len=max_len, padding_direction=padding_direction))
     test_loader = DataLoader(test_data, 
                              batch_size=args.batch_size, 
                              shuffle=False, 
-                             collate_fn=partial(collate_fn_valid, max_session_len=max_len))
+                             collate_fn=partial(collate_fn_valid, max_session_len=max_len, padding_direction=padding_direction))
     
-    if args.loss_type == 'bce':
+    if args.n_softmaxes > 1:
+        if args.loss_type != 'ce':
+            raise ValueError(f"Loss type {args.loss_type} is not supported for MoS")
+        criterion = ce_loss_mt_MoS(num_classes=n_items, device=device)
+    elif args.use_multimax:
+        criterion = ce_loss_mt_multimax(num_classes=n_items, device=device)
+    elif args.loss_type == 'bce':
         criterion = bce_loss_mt(num_classes=n_items, device=device)
     elif args.loss_type == 'ce':
         criterion = ce_loss_mt(num_classes=n_items, device=device, cl = args.cl)
@@ -321,8 +373,8 @@ if __name__ == '__main__':
 
     scheduler = StepLR(optimizer, step_size=args.lr_dc_step, gamma=args.lr_dc)
 
-    best_recall = 0
-    best_mrr = 0
+    best_recall = [0.0] * len(args.topk)
+    best_mrr = [0.0] * len(args.topk)
 
     timestamp = time.strftime('%Y-%m-%d-%H-%M-%S', time.localtime(time.time()))
     best_model_path = f'best_model_weight/best_model_{timestamp}.pth'
@@ -334,29 +386,32 @@ if __name__ == '__main__':
         scheduler.step(epoch=epoch)
 
 
-        recall, mrr = validate(valid_loader, model)
-        print('Epoch {} validation: Recall@{}: {:.4f}, MRR@{}: {:.4f} \n'.format(epoch, args.topk, recall, args.topk,
-                                                                                 mrr))
+        recalls, mrrs = validate(valid_loader, model, criterion)
+        
+        log_str = 'Epoch {} validation: '.format(epoch)
+        for k, r, m in zip(args.topk, recalls, mrrs):
+            log_str += 'Recall@{}: {:.4f}, MRR@{}: {:.4f} | '.format(k, r, k, m)
+        print(log_str)
         
         # save the best model
-        if epoch == 0:
-            best_recall = recall
-            best_mrr = mrr
-        else:
-            if recall > best_recall:
-                best_recall = recall
-                best_mrr = mrr
-                
-                torch.save(model.state_dict(), best_model_path)
-                print("Best model saved.")
+        if recalls[-1] > best_recall[-1]:
+            best_recall = recalls
+            best_mrr = mrrs
+            
+            torch.save(model.state_dict(), best_model_path)
+            print("Best model saved.")
 
-    print("Best model on validation set: Recall@{}\t MRR@{}\t".format(args.topk, args.topk))
-    print("Best model on validation set: {:.4f}\t {:.4f}".format(best_recall * 100, best_mrr * 100))
+    log_str = "Best model on validation set: "
+    for k, r, m in zip(args.topk, best_recall, best_mrr):
+        log_str += "Recall@{}: {:.4f}, MRR@{}: {:.4f} | ".format(k, r * 100, k, m * 100)
+    print(log_str)
 
     # load the best model and evaluate on the test set
     model.load_state_dict(torch.load(best_model_path))
-    recall, mrr = validate(test_loader, model)
-    print("Test: Recall@{}\t MRR@{}\t".format(args.topk, args.topk))
-    print("Test: {:.4f}\t {:.4f}".format(recall * 100, mrr * 100))
+    recalls, mrrs = validate(test_loader, model, criterion)
+    log_str = "Test results: "
+    for k, r, m in zip(args.topk, recalls, mrrs):
+        log_str += "Recall@{}: {:.4f}, MRR@{}: {:.4f} | ".format(k, r * 100, k, m * 100)
+    print(log_str)
 
 

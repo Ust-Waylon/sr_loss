@@ -1,6 +1,11 @@
 log
 run.sh
 
+dataset_rank.py
+
+dataset_stat
+
+
 requirements.txt
 
 # Ignore everything in dataset folder except retrieve.py
